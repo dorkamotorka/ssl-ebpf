@@ -123,11 +123,13 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
 
 SEC("uretprobe/SSL_read")
 int probe_SSL_read_exit(struct pt_regs *ctx) {
+    bpf_printk("SSL_read");
     return (SSL_exit(ctx, 0));
 }
 
 SEC("uretprobe/SSL_write")
 int probe_SSL_write_exit(struct pt_regs *ctx) {
+    bpf_printk("SSL_write");
     return (SSL_exit(ctx, 1));
 }
 
