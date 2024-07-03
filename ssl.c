@@ -1,136 +1,140 @@
 //go:build ignore
-#include "vmlinux.h"
-#include <bpf/bpf_core_read.h>
-#include <bpf/bpf_endian.h>
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
+
 #include "ssl.h"
 
+char __license[] SEC("license") = "Dual MIT/GPL";
+
+
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
-} perf_SSL_events SEC(".maps");
-
-#define BASE_EVENT_SIZE ((size_t)(&((struct probe_SSL_data_t *)0)->buf))
-#define EVENT_SIZE(X) (BASE_EVENT_SIZE + ((size_t)(X)))
-#define MAX_ENTRIES 10240
-
-#define min(x, y)                      \
-    ({                                 \
-        typeof(x) _min1 = (x);         \
-        typeof(y) _min2 = (y);         \
-        (void)(&_min1 == &_min2);      \
-        _min1 < _min2 ? _min1 : _min2; \
-    })
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);
+} ssl_data_event_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, u32);
-    __type(value, struct probe_SSL_data_t);
-} ssl_data SEC(".maps");
+    __type(value, struct ssl_read_data);
+} ssl_read_data_map SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_ENTRIES);
-    __type(key, __u32);
-    __type(value, __u64);
-} start_ns SEC(".maps");
+SEC("uprobe/SSL_write")
+int uprobe_libssl_write(struct pt_regs *ctx) {
+    void* buf = (void *) PT_REGS_PARM2(ctx);
+    u64 size =  PT_REGS_PARM3(ctx);
 
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_ENTRIES);
-    __type(key, __u32);
-    __type(value, __u64);
-} bufs SEC(".maps");
-
-const volatile pid_t targ_pid = 0;
-const volatile uid_t targ_uid = -1;
-
-static __always_inline bool trace_allowed(u32 uid, u32 pid)
-{
-    /* filters */
-    if (targ_pid && targ_pid != pid)
-        return false;
-    if (targ_uid != -1) {
-        if (targ_uid != uid) {
-            return false;
-        }
+    u32 map_id = 0;
+    struct ssl_data_event_t* map_value = bpf_ringbuf_reserve(&ssl_data_event_map, sizeof(struct ssl_data_event_t), 0);
+    if (!map_value) {
+	return 0; 
     }
-    return true;
+    
+    // Sanity check there's data in buffer 
+    if (size == 0) { 
+	bpf_ringbuf_discard(map_value, 0);
+	return 0;
+    }
+
+    // Store the PID and payload size
+    map_value->pid = bpf_get_current_pid_tgid() >> 32;
+    map_value->len = size;
+    map_value->egress = 1;
+	
+    u32 buf_size = MAX_BUF_SIZE;
+    if (size < buf_size) {
+	buf_size = size;
+    }
+
+    // Read buffer
+    if (bpf_probe_read_user(map_value->buf, buf_size, buf) != 0) {
+	bpf_ringbuf_discard(map_value, 0);
+	return 0;
+    }
+
+    u32 method = parse_http_method((char*)buf);
+    if (method == -1) {
+    	bpf_printk("Failed to parse HTTP method");
+    }
+
+    bpf_printk("HTTP Method ID: %d", method);
+    //bpf_printk("%s", map_value->buf);
+
+    bpf_ringbuf_submit(map_value, 0);
+
+    return 0;
 }
 
-static int SSL_exit(struct pt_regs *ctx, int rw) {
-    int ret = 0;
+// For the libssl_read call, we need a uprobe to capture
+// the user-provided buffer that the decoded result will 
+// be read into.
+SEC("uprobe/SSL_read")
+int uprobe_libssl_read(struct pt_regs *ctx) {
+    // Get a map element we can store the user's data pointer in
     u32 zero = 0;
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
-    u32 tid = (u32)pid_tgid;
-    u32 uid = bpf_get_current_uid_gid();
-    u64 ts = bpf_ktime_get_ns();
-
-    if (!trace_allowed(uid, pid)) {
+    struct ssl_read_data *data = bpf_map_lookup_elem(&ssl_read_data_map, &zero);
+    if (!data) {
         return 0;
     }
+	
+    // Store the address and size of the user-supplied buffer
+    // that we will read the decrypted data back out of.
+    data->buf = PT_REGS_PARM2(ctx);
+    data->len = PT_REGS_PARM3(ctx);
 
-    /* store arg info for later lookup */
-    u64 *bufp = bpf_map_lookup_elem(&bufs, &tid);
-    if (bufp == 0)
-        return 0;
-
-    u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
-    if (!tsp)
-        return 0;
-    u64 delta_ns = ts - *tsp;
-
-    int len = PT_REGS_RC(ctx);
-    if (len <= 0)  // no data
-        return 0;
-
-    struct probe_SSL_data_t *data = bpf_map_lookup_elem(&ssl_data, &zero);
-    if (!data)
-        return 0;
-
-    data->timestamp_ns = ts;
-    data->delta_ns = delta_ns;
-    data->pid = pid;
-    data->tid = tid;
-    data->uid = uid;
-    data->len = (u32)len;
-    data->buf_filled = 0;
-    data->rw = rw;
-    data->is_handshake = false;
-    u32 buf_copy_size = min((size_t)MAX_BUF_SIZE, (size_t)len);
-
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-
-    if (bufp != 0)
-        ret = bpf_probe_read_user(&data->buf, buf_copy_size, (char *)*bufp);
-
-    bpf_map_delete_elem(&bufs, &tid);
-    bpf_map_delete_elem(&start_ns, &tid);
-
-    if (!ret)
-        data->buf_filled = 1;
-    else
-        buf_copy_size = 0;
-
-    bpf_perf_event_output(ctx, &perf_SSL_events, BPF_F_CURRENT_CPU, data,
-                            EVENT_SIZE(buf_copy_size));
     return 0;
 }
 
 SEC("uretprobe/SSL_read")
-int probe_SSL_read_exit(struct pt_regs *ctx) {
-    bpf_printk("SSL_read");
-    return (SSL_exit(ctx, 0));
-}
+int uretprobe_libssl_read(struct pt_regs *ctx) {
+    // Once we libssl_read is complete, we can grab the buffer
+    // again, and read the decrypted results back out of it.
+    u32 zero = 0;
+    struct ssl_read_data *data = bpf_map_lookup_elem(&ssl_read_data_map, &zero);
+    if (!data) {
+        return 0;
+    }	
 
-SEC("uretprobe/SSL_write")
-int probe_SSL_write_exit(struct pt_regs *ctx) {
-    bpf_printk("SSL_write");
-    return (SSL_exit(ctx, 1));
-}
+    // We can read out the arguments passed to SSL_read by the user's code
+    // by pulling the value stashed in our uprobe (above).
+    u32 map_id = 0;
+    struct ssl_data_event_t* map_value = bpf_ringbuf_reserve(&ssl_data_event_map, sizeof(struct ssl_data_event_t), 0);
+    if (!map_value) {
+	return 0; 
+    }
 
-char LICENSE[] SEC("license") = "GPL";
+    // Store the PID and indicate this is an incoming message
+    map_value->pid = bpf_get_current_pid_tgid() >> 32;
+    map_value->egress = 0;
+	
+    // Return code of SSL_read is the number of bytes decrypted
+    // If we got none, we can bail out.
+    u64 size = PT_REGS_RC(ctx);
+    if (size == 0) { 
+	bpf_ringbuf_discard(map_value, 0);
+	return 0;
+    }
+	
+    // How much do we need to copy?
+    u32 buf_size = MAX_BUF_SIZE;
+    if (size < buf_size) {
+	buf_size = size;
+    }
+
+    // Write the buffer size back so userspace can find it
+    map_value->len = buf_size;
+
+    u32 http_status = parse_http_status((char*)data->buf);
+    if (http_status == -1) {
+    	bpf_printk("Failed to parse HTTP status");
+    }
+    bpf_printk("HTTP STATUS CODE: %d", http_status);
+
+    // Read it, and give up if it doesn't work
+    if (bpf_probe_read_user(map_value->buf, buf_size, (char*)data->buf) != 0) {
+	bpf_ringbuf_discard(map_value, 0);
+	return 0;
+    }
+
+    bpf_ringbuf_submit(map_value, 0);
+
+    return 0;
+}

@@ -1,20 +1,25 @@
 package main
 
 import (
-	"os"
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"log"
+	"os"
 	"fmt"
+	"os/signal"
+	"os/exec"
 	"strings"
 	"bufio"
-	"bytes"
-	"os/exec"
+	"syscall"
 
-	"github.com/cilium/ebpf/perf"
-	"github.com/cilium/ebpf/rlimit"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 ssl ssl.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -type ssl_data_event_t bpf ssl.c
 
 func findLibraryPath(libname string) (string, error) {
 	cmd := exec.Command("sh", "-c", fmt.Sprintf("ldconfig -p | grep %s", libname))
@@ -41,68 +46,98 @@ func findLibraryPath(libname string) (string, error) {
 	return "", fmt.Errorf("library not found")
 }
 
-func attachOpenssl(sslObjs sslObjects, path string) (error) {
-	ex, err := link.OpenExecutable(path)
-	if err != nil {
-		log.Printf("error opening executable %s", path)
-		return err
-	}
-
-	_, err = ex.Uprobe("SSL_write", sslObjs.ProbeSSL_writeExit, nil)
-	if err != nil {
-		log.Fatalf("error attaching %s uprobe", "SSL_write")
-		return err
-	}
-
-	_, err = ex.Uretprobe("SSL_read", sslObjs.ProbeSSL_readExit, nil)
-	if err != nil {
-		log.Fatalf("error attaching %s uretprobe", "SSL_read")
-		return err
-	}
-
-	return nil
-}
 
 func main() {
+	stopper := make(chan os.Signal, 1)
+	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+
 	// Allow the current process to lock memory for eBPF resources.
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
 	}
 
 	// Load pre-compiled programs and maps into the kernel.
-	sslObjs := sslObjects{}
-	if err := loadSslObjects(&sslObjs, nil); err != nil {
-		log.Fatal(err)
+	objs := bpfObjects{}
+	if err := loadBpfObjects(&objs, nil); err != nil {
+		log.Fatalf("loading objects: %s", err)
 	}
+	defer objs.Close()
 
 	opensslPath, err := findLibraryPath("libssl.so");
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("OpenSSL path: %s\n", opensslPath);
-	attachOpenssl(sslObjs, opensslPath);
 
-	L7EventsReader, err := perf.NewReader(sslObjs.PerfSSL_events, int(4096)*os.Getpagesize())
+	// Open an ELF binary and read its symbols.
+	ex, err := link.OpenExecutable(opensslPath)
 	if err != nil {
-		log.Fatal("error creating perf event array reader")
+		log.Fatalf("opening executable: %s", err)
 	}
 
+	// Set up SSL probes
+	uprobe_ssl_write, err := ex.Uprobe("SSL_write", objs.UprobeLibsslWrite, nil)
+	if err != nil {
+		log.Fatalf("creating uprobe - SSL_write: %s", err)
+	}
+	defer uprobe_ssl_write.Close()
+
+	uprobe_ssl_read, err := ex.Uprobe("SSL_read", objs.UprobeLibsslRead, nil)
+	if err != nil {
+		log.Fatalf("creating uprobe - SSL_read: %s", err)
+	}
+	defer uprobe_ssl_read.Close()
+
+	uretprobe_ssl_read, err := ex.Uretprobe("SSL_read", objs.UretprobeLibsslRead, nil)
+	if err != nil {
+		log.Fatalf("Creating uretprobe - SSL_read: %s", err)
+	}
+	defer uretprobe_ssl_read.Close()
+
+	rd, err := ringbuf.NewReader(objs.SslDataEventMap)
+	if err != nil {
+		log.Fatalf("opening ringbuf reader: %s", err)
+	}
+	defer rd.Close()
+
+	// Close the reader when the process receives a signal, which will exit
+	// the read loop.
+	go func() {
+		<-stopper
+
+		if err := rd.Close(); err != nil {
+			log.Fatalf("closing ringbuf reader: %s", err)
+		}
+	}()
+
+	log.Println("Waiting for events..")
+
+	var event bpfSslDataEventT
 	for {
-		var record perf.Record
-		err := L7EventsReader.ReadInto(&record)
+		record, err := rd.Read()
 		if err != nil {
-			log.Print("error reading from perf array")
+			if errors.Is(err, ringbuf.ErrClosed) {
+				log.Println("Received signal, exiting..")
+				return
+			}
+			log.Printf("reading from reader: %s", err)
+			continue
 		}
 
-		if record.LostSamples != 0 {
-			log.Printf("lost samples l7-event %d", record.LostSamples)
+		// Parse the ringbuf event entry into a bpfSslDataEventT structure.
+		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
+			log.Printf("error parsing ringbuf event: %s", err)
+			continue
 		}
 
-		if record.RawSample == nil || len(record.RawSample) == 0 {
-			log.Print("read sample l7-event nil or empty")
-			return
+		msg_bytes := event.Buf[0:event.Len]
+		msg := unix.ByteSliceToString(msg_bytes)
+
+		msg_type := "Sent"
+		if event.Egress == 0 {
+			msg_type = "Received"
 		}
 
-		log.Println("read sample l7-event")
+		log.Printf("%s: pid: %d size: %d\n%s\n\n", msg_type, event.Pid, event.Len, msg)
 	}
 }
