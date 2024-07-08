@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 
 # Latency values in milliseconds
+operations = ['GET,POST,PUT,PATCH,DELETE,CONNECT,OPTIONS,TRACE']
 latency_with_ebpf = [0.0076]  
 latency_without_ebpf = [0.0074] 
 
@@ -18,6 +19,7 @@ ax.set_xlabel('Operation')
 ax.set_ylabel('Latency (ms)')
 ax.set_title('HTTPS Latency Comparison with and without eBPF')
 ax.set_xticks(x)
+ax.set_xticklabels(operations)
 ax.legend()
 
 # Display the plot
